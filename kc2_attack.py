@@ -27,7 +27,7 @@ This is a pure-Python implementation built on python-sat's Glucose4, matching
 the paper's choice of Glucose with *incremental* solving and assumptions.
 The KC2 "core" simplification layer is implemented:
 
-  * one persistent incremental SAT instance reused across the whole attack
+  * one persistent incremental SAT instance reused across the wh ole attack
     (sec. III-B);
   * key-condition crunching by constant-propagating each I/O constraint into
     a compact, cofactored circuit copy over the *shared* key variables, so the
@@ -74,19 +74,24 @@ class Circuit:
     is the corresponding next-state.
     """
 
-    def __init__(self, inputs, outputs, gates):
+    def __init__(self, inputs, outputs, gates, keys=None):
         self.gates = gates                      # name -> {'type', 'inputs'}
         self.dffs = [w for w, g in gates.items() if g['type'] == 'DFF']
         self.dff_d = {w: gates[w]['inputs'][0] for w in self.dffs}
         dff_set = set(self.dffs)
 
-        # primary inputs split into "real" inputs and key inputs
+        # Key inputs come either from explicit KEY(...) declarations or from
+        # INPUT(...) names following the usual key conventions (keyinput* / key_*).
+        explicit = set(keys or [])
+
+        def is_key(w):
+            lw = w.lower()
+            return w in explicit or lw.startswith('keyinput') or lw.startswith('key_')
+
         self.outputs = list(outputs)
-        self.key_inputs = sorted(
-            (w for w in inputs if w.lower().startswith('keyinput')),
-            key=_key_index,
-        )
-        self.inputs = [w for w in inputs if not w.lower().startswith('keyinput')]
+        all_keys = list(explicit) + [w for w in inputs if is_key(w)]
+        self.key_inputs = sorted(dict.fromkeys(all_keys), key=_key_index)
+        self.inputs = [w for w in inputs if not is_key(w)]
 
         self.is_sequential = bool(self.dffs)
         self.order = self._topo(dff_set)
@@ -124,7 +129,7 @@ def _key_index(name):
 
 
 def parse_bench(path):
-    inputs, outputs, gates = [], [], {}
+    inputs, outputs, gates, keys = [], [], {}, []
     with open(path) as fh:
         for raw in fh:
             line = raw.split('#', 1)[0].strip()
@@ -133,6 +138,8 @@ def parse_bench(path):
             up = line.upper()
             if up.startswith('INPUT('):
                 inputs.append(line[line.index('(') + 1:line.rindex(')')].strip())
+            elif up.startswith('KEY('):
+                keys.append(line[line.index('(') + 1:line.rindex(')')].strip())
             elif up.startswith('OUTPUT('):
                 outputs.append(line[line.index('(') + 1:line.rindex(')')].strip())
             elif '=' in line:
@@ -144,7 +151,7 @@ def parse_bench(path):
                 args = rhs[rhs.index('(') + 1:rhs.rindex(')')]
                 gates[lhs] = {'type': gt,
                               'inputs': [a.strip() for a in args.split(',') if a.strip()]}
-    return Circuit(inputs, outputs, gates)
+    return Circuit(inputs, outputs, gates, keys)
 
 
 # ---------------------------------------------------------------------------
@@ -374,13 +381,18 @@ def encode_frame(enc, circ, keymap, input_vals, state_vals):
 
 class KC2Attack:
     def __init__(self, locked, oracle, crunch=True, verbose=True):
-        if locked.inputs != oracle.inputs:
-            # tolerate ordering, but the PI *sets* must match for oracle queries
-            if set(locked.inputs) != set(oracle.inputs):
-                raise ValueError(
-                    "locked and oracle primary-input sets differ; cannot query oracle")
+        if set(locked.inputs) != set(oracle.inputs):
+            raise ValueError(
+                "locked and oracle primary-input sets differ; cannot query oracle")
+        if len(locked.outputs) != len(oracle.outputs):
+            raise ValueError(
+                f"output count differs: locked has {len(locked.outputs)}, "
+                f"oracle has {len(oracle.outputs)}")
         self.locked = locked
         self.oracle = oracle
+        # lockers may rename primary outputs (e.g. SARLock's 'N223' -> 'N223_sarlock'),
+        # so correspond locked<->oracle outputs positionally, not by name.
+        self.out_map = list(zip(locked.outputs, oracle.outputs))
         self.crunch = crunch
         self.verbose = verbose
         self.enc = Enc()
@@ -410,8 +422,8 @@ class KC2Attack:
             for iv, ov in zip(input_seq, out_seq):
                 ivals = {pi: (T if iv[pi] else F) for pi in self.locked.inputs}
                 outs, state = encode_frame(self.enc, self.locked, key, ivals, state)
-                for o in self.locked.outputs:
-                    self.enc.fix(outs[o], ov[o])
+                for lo, oo in self.out_map:
+                    self.enc.fix(outs[lo], ov[oo])
 
     def _generalize_block(self, key_assign):
         """Negative-key-condition compression (sec. III-E).
@@ -465,10 +477,10 @@ class KC2Attack:
             if self.crunch:
                 # whichever candidate disagrees with the oracle is now dead
                 lo, _ = simulate(self.locked, {**dip, **_keymap_int(cand1)})
-                if any(lo[o] != ov[o] for o in self.locked.outputs):
+                if any(lo[lo_o] != ov[oo] for lo_o, oo in self.out_map):
                     self._generalize_block(cand1)
                 lo, _ = simulate(self.locked, {**dip, **_keymap_int(cand2)})
-                if any(lo[o] != ov[o] for o in self.locked.outputs):
+                if any(lo[lo_o] != ov[oo] for lo_o, oo in self.out_map):
                     self._generalize_block(cand2)
 
             if self.queries % 25 == 0:
@@ -477,14 +489,15 @@ class KC2Attack:
         return self._extract_key()
 
     # -- sequential attack (Algorithm 1 + KC2) ------------------------------
-    def run_sequential(self, max_iter, max_depth):
+    def run_sequential(self, max_iter, max_depth, min_term_depth=2):
         enc = self.enc
         self.frame_inputs = []          # symbolic inputs, one dict per frame
         self.frame_diffs = []           # per-frame list of output-XOR values
         self._st1 = {d: F for d in self.locked.dffs}     # reset (R)
         self._st2 = {d: F for d in self.locked.dffs}
         self._built = 0
-        self._ce = self._build_ce_gadget()
+        self._ce = self._build_ce_gadget()   # sound transition-relation induction
+        self.term_reason = "max-iter"
 
         b = 1
         self._extend_unrolling(b)
@@ -502,17 +515,38 @@ class KC2Attack:
                     self.log(f"[kc2] {self.queries} DISes, depth {b}, "
                              f"{enc.n_clauses} clauses")
             else:
-                # no disagreement up to depth b: check CE termination
+                # No disagreement reachable within b steps from reset.
+                # (1) Sound stop: if the two key copies have an identical
+                # transition+output relation (s1==s2 is inductive), they agree
+                # on every reachable state -- a provable equivalence.
                 if not enc.solver.solve(assumptions=[self._ce]):
-                    self.log(f"[kc2] combinational-equivalence termination at depth {b}")
+                    self.term_reason = f"provable equivalence (depth {b})"
+                    self.log(f"[kc2] {self.term_reason}")
                     break
+                # (2) Practical stop: the remaining key freedom may live on
+                # unreachable states (true don't-cares). Validate the currently
+                # constrained key by heavy simulation over sequences longer than
+                # the exhausted BMC depth; if it matches the oracle it is a
+                # working key. This is a bounded (not unbounded-formal) result.
+                if b >= min_term_depth:
+                    kb = self._extract_key()
+                    seq_len = max(200, 8 * b)
+                    if verify(self.locked, self.oracle, kb,
+                              n_patterns=40 * seq_len, seq_len=seq_len, seed=12345):
+                        self._validated_key = kb
+                        self.term_reason = (f"simulation-validated (no DIS within "
+                                            f"depth {b}, checked to {seq_len} cycles)")
+                        self.log(f"[kc2] {self.term_reason}")
+                        break
                 if b >= max_depth:
-                    self.log(f"[kc2] reached max unroll depth {max_depth}; stopping")
+                    self.term_reason = f"hit max unroll depth {max_depth}"
+                    self.log(f"[kc2] {self.term_reason}; stopping "
+                             f"(key may be under-constrained on unreachable states)")
                     break
                 b *= 2
                 self._extend_unrolling(b)
                 self.log(f"[kc2] extending unroll depth -> {b}")
-        return self._extract_key()
+        return getattr(self, "_validated_key", None) or self._extract_key()
 
     def _extend_unrolling(self, b):
         enc = self.enc
@@ -538,13 +572,16 @@ class KC2Attack:
         return s
 
     def _build_ce_gadget(self):
-        """A single transition image from an *unconstrained* start state that
-        asserts k1 and k2 differ in output or next-state. UNSAT (under the
-        accumulated key conditions) => combinational equivalence => terminate."""
+        """Transition-relation 1-induction gadget: from a common start state
+        (s1 == s2) with a shared input, assert the two key copies differ in
+        some output or next-state. Assuming this selector, UNSAT (under the
+        accumulated I/O constraints) means s1 == s2 is inductive and outputs
+        always agree -- so from reset the copies stay identical forever and the
+        keys are equivalent on every reachable state (a sound termination)."""
         enc = self.enc
         ivars = self._fresh_inputs()
         st1 = {d: ('L', enc.newvar()) for d in self.locked.dffs}
-        st2 = {d: st1[d] for d in self.locked.dffs}       # same start state
+        st2 = {d: st1[d] for d in self.locked.dffs}       # common start state
         o1, n1 = encode_frame(enc, self.locked, self.k1, ivars, st1)
         o2, n2 = encode_frame(enc, self.locked, self.k2, ivars, st2)
         diffs = [enc.XOR([o1[o], o2[o]]) for o in self.locked.outputs]
@@ -581,22 +618,23 @@ def T_SELECT(enc):
 def verify(locked, oracle, key_bits, n_patterns=400, seq_len=40, seed=0):
     rng = random.Random(seed)
     km = _keymap_int(key_bits)
+    out_map = list(zip(locked.outputs, oracle.outputs))
     if locked.is_sequential:
         for _ in range(n_patterns // seq_len + 1):
             seq = [{pi: rng.randint(0, 1) for pi in oracle.inputs}
                    for _ in range(seq_len)]
             exp = oracle_response(oracle, seq)
-            ls, gs = {d: 0 for d in locked.dffs}, None
+            ls = {d: 0 for d in locked.dffs}
             for t, iv in enumerate(seq):
                 louts, ls = simulate(locked, {**iv, **km}, ls)
-                if any(louts[o] != exp[t][o] for o in locked.outputs):
+                if any(louts[lo] != exp[t][oo] for lo, oo in out_map):
                     return False
         return True
     for _ in range(n_patterns):
         iv = {pi: rng.randint(0, 1) for pi in oracle.inputs}
         exp, _ = simulate(oracle, iv)
         got, _ = simulate(locked, {**iv, **km})
-        if any(got[o] != exp[o] for o in locked.outputs):
+        if any(got[lo] != exp[oo] for lo, oo in out_map):
             return False
     return True
 
@@ -647,11 +685,13 @@ def main():
     width = (len(locked.key_inputs) + 3) // 4
 
     print("=" * 60)
-    print("  KC2 attack — result")
+    print("  KC2 attack - result")
     print("=" * 60)
     print(f"  queries (DIP/DIS) : {attack.queries}")
     print(f"  clauses learned   : {attack.enc.n_clauses}")
     print(f"  runtime           : {elapsed:.3f} s")
+    if locked.is_sequential:
+        print(f"  termination       : {getattr(attack, 'term_reason', 'n/a')}")
     bits = ''.join(str(key_bits[k]) for k in reversed(locked.key_inputs))
     print(f"  recovered key bin : {bits}")
     print(f"  recovered key hex : 0x{kint:0{max(width,1)}X}")

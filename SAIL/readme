@@ -1,0 +1,2 @@
+- run sail_main.py to run the attack 
+SAIL works only with combinational obfuscation algorithms so try EPIC, but TTLock and SARlock should also work, just not as successfully
